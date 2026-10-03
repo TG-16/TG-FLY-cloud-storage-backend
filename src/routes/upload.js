@@ -107,6 +107,46 @@ router.post('/presign', auth, uploadChunkLimiter, async (req, res) => {
   }
 });
 
+// POST /api/upload/presign-batch — Get presigned URLs for multiple chunks
+router.post('/presign-batch', auth, uploadChunkLimiter, async (req, res) => {
+  try {
+    const { uploadId, partNumbers } = req.body;
+
+    if (!Array.isArray(partNumbers) || partNumbers.length === 0) {
+      return res.status(400).json({ message: 'partNumbers must be a non-empty array' });
+    }
+
+    // Find the upload session
+    const sessions = await query(
+      'SELECT us.*, f.s3_key FROM upload_sessions us JOIN files f ON us.file_id = f.id WHERE us.s3_upload_id = ? AND us.user_id = ?',
+      [uploadId, req.user.id]
+    );
+
+    if (sessions.length === 0) {
+      return res.status(404).json({ message: 'Upload session not found' });
+    }
+
+    const session = sessions[0];
+    
+    // Generate all URLs in parallel
+    const urls = {};
+    await Promise.all(partNumbers.map(async (partNumber) => {
+      const command = new UploadPartCommand({
+        Bucket: BUCKET,
+        Key: session.s3_key,
+        UploadId: uploadId,
+        PartNumber: partNumber,
+      });
+      urls[partNumber] = await getSignedUrl(s3Client, command, { expiresIn: 3600 }); // 1 hour for batch
+    }));
+
+    res.json({ urls });
+  } catch (err) {
+    console.error('Presign batch error:', err);
+    res.status(500).json({ message: 'Failed to generate upload URLs' });
+  }
+});
+
 // POST /api/upload/complete
 router.post('/complete', auth, async (req, res) => {
   try {
@@ -129,7 +169,9 @@ router.post('/complete', auth, async (req, res) => {
       Key: session.s3_key,
       UploadId: uploadId,
       MultipartUpload: {
-        Parts: parts.map(p => ({ PartNumber: p.PartNumber, ETag: p.ETag })),
+        Parts: parts
+          .sort((a, b) => a.PartNumber - b.PartNumber)
+          .map(p => ({ PartNumber: p.PartNumber, ETag: p.ETag })),
       },
     });
     await s3Client.send(command);
@@ -209,6 +251,44 @@ router.delete('/:uploadId', auth, async (req, res) => {
   } catch (err) {
     console.error('Abort upload error:', err);
     res.status(500).json({ message: 'Failed to abort upload' });
+  }
+});
+
+const { ListPartsCommand } = require('@aws-sdk/client-s3');
+
+// GET /api/upload/:uploadId/parts — Get completed parts for an upload session directly from S3
+router.get('/:uploadId/parts', auth, async (req, res) => {
+  try {
+    const { uploadId } = req.params;
+
+    const sessions = await query(
+      'SELECT f.s3_key FROM upload_sessions us JOIN files f ON us.file_id = f.id WHERE us.s3_upload_id = ? AND us.user_id = ?',
+      [uploadId, req.user.id]
+    );
+
+    if (sessions.length === 0) {
+      return res.status(404).json({ message: 'Upload session not found' });
+    }
+
+    const command = new ListPartsCommand({
+      Bucket: BUCKET,
+      Key: sessions[0].s3_key,
+      UploadId: uploadId,
+    });
+    
+    try {
+      const response = await s3Client.send(command);
+      const completedParts = (response.Parts || []).map(p => ({
+        PartNumber: p.PartNumber,
+        ETag: p.ETag
+      }));
+      res.json({ completedParts });
+    } catch (s3Err) {
+      res.json({ completedParts: [] }); // Default to empty if S3 throws (e.g. no parts yet)
+    }
+  } catch (err) {
+    console.error('Get parts error:', err);
+    res.status(500).json({ message: 'Failed to get upload parts' });
   }
 });
 
